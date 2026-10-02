@@ -53,12 +53,13 @@ class ScreenGuard(commands.Cog):
 
     def _median(self, channel_id, now, window):
         buf = self.samples[channel_id]
-        while buf and now - buf[0][0] > window:
+        # keep one extra interval so timing jitter can't drop us below full coverage
+        while buf and now - buf[0][0] > window + SAMPLE_INTERVAL:
             buf.popleft()
-        # require the window to be (almost) fully covered before judging
-        if not buf or now - buf[0][0] < window * 0.9:
-            return None
-        return statistics.median(c for _, c in buf)
+        if not buf or now - buf[0][0] < window - SAMPLE_INTERVAL / 2:
+            return None  # still warming up
+        counts = [c for t, c in buf if now - t <= window]
+        return statistics.median(counts) if counts else None
 
     async def _check_guild(self, guild, now):
         conf = await self.config.guild(guild).all()
@@ -72,18 +73,26 @@ class ScreenGuard(commands.Cog):
                 continue
             self.samples[cid].append((now, len(channel.members)))
             med = self._median(cid, now, conf["window"])
-            if med is None:
-                continue
-
             is_locked = str(cid) in conf["locked"]
-            if med >= conf["threshold"] and not is_locked:
-                await self._lock(channel, role, med)
-            elif (
-                is_locked
-                and conf["restore"]
-                and med < min(conf["unlock_threshold"], conf["threshold"])
-            ):
-                await self._unlock(channel, role, med)
+
+            just_locked = False
+            if med is not None:
+                if med >= conf["threshold"] and not is_locked:
+                    is_locked = just_locked = await self._lock(channel, role, med)
+                elif (
+                    is_locked
+                    and conf["restore"]
+                    and med < min(conf["unlock_threshold"], conf["threshold"])
+                ):
+                    is_locked = not await self._unlock(channel, role)
+
+            # Runs every cycle while locked, so stragglers (or streams missed
+            # because the channel cache was stale right after locking) get caught.
+            if is_locked:
+                # Self-heal: record says locked but the overwrite was changed/lost.
+                if not just_locked and channel.overwrites_for(role).stream is not False:
+                    await self._reapply(channel, role)
+                await self._bounce_streamers(channel, conf["bounce_channel"])
 
     # ---------- lock / unlock ----------
 
@@ -99,34 +108,27 @@ class ScreenGuard(commands.Cog):
             if channel.id not in self._warned:
                 self._warned.add(channel.id)
                 log.warning("Could not lock %s: %s", channel.id, e)
-            return
+            return False
         self._warned.discard(channel.id)
         async with self.config.guild(channel.guild).locked() as locked:
             locked[str(channel.id)] = prev
-        await self._bounce_streamers(channel)
+        return True
 
-    async def _bounce_streamers(self, channel):
-        """Move active streamers out and back in to end their stream."""
-        bounce_id = await self.config.guild(channel.guild).bounce_channel()
-        bounce = channel.guild.get_channel(bounce_id) if bounce_id else None
-        if not isinstance(bounce, discord.VoiceChannel) or bounce.id == channel.id:
-            return
-        streamers = [
-            m for m in channel.members
-            if m.voice and m.voice.self_stream and not channel.permissions_for(m).stream
-        ]
-        for m in streamers:
-            try:
-                await m.move_to(bounce, reason="ScreenGuard: ending stream")
-                await asyncio.sleep(0.5)
-                await m.move_to(channel, reason="ScreenGuard: returning member")
-            except discord.HTTPException as e:
-                log.warning("Could not bounce %s in %s: %s", m.id, channel.id, e)
-            await asyncio.sleep(0.5)
+    async def _reapply(self, channel, role):
+        ow = channel.overwrites_for(role)
+        ow.stream = False
+        try:
+            await channel.set_permissions(
+                role, overwrite=ow, reason="ScreenGuard: re-applying lock"
+            )
+        except discord.HTTPException as e:
+            if channel.id not in self._warned:
+                self._warned.add(channel.id)
+                log.warning("Could not re-apply lock on %s: %s", channel.id, e)
 
-    async def _unlock(self, channel, role, med=None):
-        async with self.config.guild(channel.guild).locked() as locked:
-            prev = locked.pop(str(channel.id), None)
+    async def _unlock(self, channel, role):
+        locked = await self.config.guild(channel.guild).locked()
+        prev = locked.get(str(channel.id))
         ow = channel.overwrites_for(role)
         ow.stream = prev
         try:
@@ -137,6 +139,37 @@ class ScreenGuard(commands.Cog):
             )
         except discord.HTTPException as e:
             log.warning("Could not unlock %s: %s", channel.id, e)
+            return False  # keep the locked record so it retries next cycle
+        async with self.config.guild(channel.guild).locked() as l:
+            l.pop(str(channel.id), None)
+        return True
+
+    async def _bounce_streamers(self, channel, bounce_id):
+        """Move active streamers out and back in to end their stream."""
+        bounce = channel.guild.get_channel(bounce_id) if bounce_id else None
+        if not isinstance(bounce, discord.VoiceChannel) or bounce.id == channel.id:
+            return
+        streamers = [
+            m for m in channel.members
+            if m.voice and m.voice.self_stream and not channel.permissions_for(m).stream
+        ]
+        for m in streamers:
+            if not m.voice or m.voice.channel != channel:
+                continue
+            try:
+                await m.move_to(bounce, reason="ScreenGuard: ending stream")
+            except discord.HTTPException as e:
+                log.warning("Could not move %s out of %s: %s", m.id, channel.id, e)
+                continue
+            await asyncio.sleep(0.5)
+            for _ in range(3):
+                try:
+                    await m.move_to(channel, reason="ScreenGuard: returning member")
+                    break
+                except discord.HTTPException as e:
+                    log.warning("Could not return %s to %s: %s", m.id, channel.id, e)
+                    await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
 
     # ---------- commands ----------
 
