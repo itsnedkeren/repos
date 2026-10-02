@@ -23,6 +23,7 @@ class ScreenGuard(commands.Cog):
             channels=[],     # monitored voice channel IDs
             role=None,       # role ID that loses Stream
             threshold=20,    # median occupancy that triggers the lock
+            unlock_threshold=15,  # median must fall below this to unlock
             window=120,      # seconds the median is computed over
             restore=True,    # unlock when median drops below threshold
             locked={},       # {channel_id: previous overwrite value (True/False/None)}
@@ -77,7 +78,11 @@ class ScreenGuard(commands.Cog):
             is_locked = str(cid) in conf["locked"]
             if med >= conf["threshold"] and not is_locked:
                 await self._lock(channel, role, med)
-            elif med < conf["threshold"] and is_locked and conf["restore"]:
+            elif (
+                is_locked
+                and conf["restore"]
+                and med < min(conf["unlock_threshold"], conf["threshold"])
+            ):
                 await self._unlock(channel, role, med)
 
     # ---------- lock / unlock ----------
@@ -183,6 +188,14 @@ class ScreenGuard(commands.Cog):
         await ctx.tick()
 
     @screenguard.command()
+    async def unlockthreshold(self, ctx, amount: int):
+        """Median occupancy the channel must fall below to unlock (default 15)."""
+        if amount < 0:
+            return await ctx.send("Must be 0 or more.")
+        await self.config.guild(ctx.guild).unlock_threshold.set(amount)
+        await ctx.tick()
+
+    @screenguard.command()
     async def window(self, ctx, seconds: int):
         """Seconds the median is computed over (30-900, default 120)."""
         if not 30 <= seconds <= 900:
@@ -205,7 +218,7 @@ class ScreenGuard(commands.Cog):
         lines = [
             f"Role: {role.mention if role else 'not set'}",
             f"Bounce channel: {(ctx.guild.get_channel(conf['bounce_channel']) or 'not set') if conf['bounce_channel'] else 'not set'}",
-            f"Threshold: {conf['threshold']} | Window: {conf['window']}s | "
+            f"Lock at: {conf['threshold']} | Unlock below: {min(conf['unlock_threshold'], conf['threshold'])} | Window: {conf['window']}s | "
             f"Auto-restore: {conf['restore']}",
         ]
         for cid in conf["channels"]:
