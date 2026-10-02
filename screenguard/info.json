@@ -1,0 +1,11 @@
+{
+    "author": ["you"],
+    "name": "ScreenGuard",
+    "short": "Disables screen share for a role when a voice channel gets crowded.",
+    "description": "Samples voice channel occupancy and denies the Stream permission to a chosen role when the median over a time window reaches a threshold.",
+    "tags": ["voice", "moderation"],
+    "min_bot_version": "3.5.0",
+    "end_user_data_statement": "This cog does not store end user data.",
+    "requirements": [],
+    "type": "COG"
+}
