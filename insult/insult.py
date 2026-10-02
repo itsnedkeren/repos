@@ -13,6 +13,16 @@ _ = Translator("Insult", __file__)
 
 MAX_LENGTH = 1500
 
+# This user can't be insulted; anyone who tries gets the message below instead.
+PROTECTED_USER_ID = 316320596705148938
+PROTECTED_MESSAGE = _(
+    "Oh, you really thought you could insult that particular person? Bold of you. "
+    "Take a moment to reflect on the choices that brought you here, because this is "
+    "one target that is firmly off limits, and no amount of clever phrasing, "
+    "persistence or puppy-dog eyes is going to change that. Why not aim that "
+    "creative energy at someone else, or better yet, go outside and touch some grass?"
+)
+
 
 @cog_i18n(_)
 class Insult(commands.Cog):
@@ -60,6 +70,15 @@ class Insult(commands.Cog):
         pool = await self._pool(ctx.guild)
         if not pool:
             await ctx.send(_("There are no insults available. Add some with `{p}insultset add`.").format(p=ctx.clean_prefix))
+            return
+
+        if user and user.id == PROTECTED_USER_ID:
+            await ctx.send(
+                f"{ctx.author.mention} {PROTECTED_MESSAGE}",
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=False, roles=False, users=[ctx.author]
+                ),
+            )
             return
 
         target = user or ctx.author
