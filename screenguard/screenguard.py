@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import statistics
 import time
@@ -25,6 +26,7 @@ class ScreenGuard(commands.Cog):
             window=120,      # seconds the median is computed over
             restore=True,    # unlock when median drops below threshold
             locked={},       # {channel_id: previous overwrite value (True/False/None)}
+            bounce_channel=None,  # voice channel used to kick active streams
         )
         self.samples = defaultdict(deque)  # channel_id -> deque[(monotonic_ts, count)]
         self._warned = set()
@@ -96,6 +98,26 @@ class ScreenGuard(commands.Cog):
         self._warned.discard(channel.id)
         async with self.config.guild(channel.guild).locked() as locked:
             locked[str(channel.id)] = prev
+        await self._bounce_streamers(channel)
+
+    async def _bounce_streamers(self, channel):
+        """Move active streamers out and back in to end their stream."""
+        bounce_id = await self.config.guild(channel.guild).bounce_channel()
+        bounce = channel.guild.get_channel(bounce_id) if bounce_id else None
+        if not isinstance(bounce, discord.VoiceChannel) or bounce.id == channel.id:
+            return
+        streamers = [
+            m for m in channel.members
+            if m.voice and m.voice.self_stream and not channel.permissions_for(m).stream
+        ]
+        for m in streamers:
+            try:
+                await m.move_to(bounce, reason="ScreenGuard: ending stream")
+                await asyncio.sleep(0.5)
+                await m.move_to(channel, reason="ScreenGuard: returning member")
+            except discord.HTTPException as e:
+                log.warning("Could not bounce %s in %s: %s", m.id, channel.id, e)
+            await asyncio.sleep(0.5)
 
     async def _unlock(self, channel, role, med=None):
         async with self.config.guild(channel.guild).locked() as locked:
@@ -141,6 +163,12 @@ class ScreenGuard(commands.Cog):
         await ctx.tick()
 
     @screenguard.command()
+    async def bouncechannel(self, ctx, channel: discord.VoiceChannel = None):
+        """Set the temporary channel used to end active streams (omit to disable)."""
+        await self.config.guild(ctx.guild).bounce_channel.set(channel.id if channel else None)
+        await ctx.tick()
+
+    @screenguard.command()
     async def role(self, ctx, role: discord.Role):
         """Set the role that loses Stream permission."""
         await self.config.guild(ctx.guild).role.set(role.id)
@@ -176,6 +204,7 @@ class ScreenGuard(commands.Cog):
         now = time.monotonic()
         lines = [
             f"Role: {role.mention if role else 'not set'}",
+            f"Bounce channel: {(ctx.guild.get_channel(conf['bounce_channel']) or 'not set') if conf['bounce_channel'] else 'not set'}",
             f"Threshold: {conf['threshold']} | Window: {conf['window']}s | "
             f"Auto-restore: {conf['restore']}",
         ]
